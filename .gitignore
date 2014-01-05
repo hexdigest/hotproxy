@@ -1,3 +1,5 @@
+# Executable
+hotproxy
 # Object files
 *.o
 *.ko

@@ -1,30 +1,19 @@
-Welcome to Transparent Proxying
--------------------------------
-
 Introduction
 ------------
 
-The program is used in conjunction with the FreeBSD (ipfw and ipnat) or
-Linux transparent proxy feature (ipfwadm, ipchains, iptables), to
-transparently proxy HTTP requests.
+The program is used in conjunction with the Linux iptables or FreeBSD (ipfw and
+ipnat) to transparently proxy HTTP requests. It's basically a fork of
+ftp://ftp.nlc.net.au/pub/unix/transproxy/ with some functionality
 
-Where Do I Get It?
-------------------
-
-The latest version, along with historical versions, of this package
-will always be at the follwing URL ftp://ftp.nlc.net.au/pub/unix/transproxy/
-with a name like transproxy-x.x.tgz.
 
 How Is It Used?
 ---------------
 
-Take for example the network configuration of a FreeBSD or Linux box acting as
-a dialin server (or terminal server), and another FreeBSD or Linux box acting
-as a Squid (or any other) proxy cache. Normally users would have to
-configure their browser to access the proxy. This transparent proxy
-will automatically intercept HTTP accesses and re-direct them to the
-Squid (or any other) proxy server. The users need not even know that
-a proxy is being used, it's that transparent.
+If you want to make a WiFi hotspot that should redirect users to some
+page before letting them to watch requested page this program is what you need.
+It should nomally run on simple wifi routers with OpenWRT installed.
+I plan to create special package for OpenWRT.
+
 
 How Do I Build It?
 ------------------
@@ -39,61 +28,16 @@ How Do I Install It?
 Just type 'make install' to install the binary and man page. Then
 choose either one of 'Inetd Installation' or 'Standalone Server'.
 
-Inetd Installation
-------------------
+Find a place to add the server startup to, /etc/rc.d/rc.local
+or something similar. Add a line like the following to this
+file.
 
-For a low volume application, using inetd to start the proxy is very
-simple. The installation places the proxy on port 81, just above the
-normal HTTP port. Just follow these steps.
+	hotproxy -p 81 -u nobody -h 127.0.0.1
 
-1)	Add a line like the following to /etc/services.
+This tells the transparent proxy server to accept requests on port
+81 and to pass these on to the host 'proxy' at port 8080.
 
-	tproxy		81/tcp			# Transparent Proxy
-
-2)	Add a line like the following to /etc/inetd.conf
-
-	tproxy	stream	tcp	nowait	nobody	/usr/sbin/tcpd	tproxy <your-proxy-server> 8080
-
-	This tells inetd to accept requests on port 81, and the transparent
-	proxy server to pass these on to the host 'proxy' at port 8080.
-
-3)	Restart the inetd daemon, usually 'kill -HUP `cat /var/run/inetd.pid`'
-	does the trick. But check first before running this shell command.
-
-Standalone Server
------------------
-
-For high volume applications it's best to install the server as a standalone
-server. This prevents inetd having to start a new process for ever new
-request. Just follow these steps.
-
-1)	Find a place to add the server startup to, /etc/rc.d/rc.local
-	or something similar. Add a line like the following to this
-	file.
-
-	tproxy -s 81 -r nobody <your-proxy-server> 8080
-
-	This tells the transparent proxy server to accept requests on port
-	81 and to pass these on to the host 'proxy' at port 8080.
-
-2)	The -t option may be given to make the proxy act in a completely
-	transparent mode. Normal operation is for the proxy daemon to
-	convert HTTP requests to a form suitable for a Squid (or any other)
-	proxy cache.
-
-FreeBSD ipfw and ipnat Config
------------------------------
-
-You need FreeBSD 3.0 or higher, a 2.2.x doesn't have the required features.
-
-I suggest you use ipfw as ipnat imposes a much higher overhead.
-
-Add 2 filter entries like below:
-
-# ipfw add 1000 allow tcp from <this-host> to any 80
-# ipfw add 1010 fwd <your-proxy-server>,81 tcp from any to any 80
-
-Linux Ipfwadm, Ipchains, Iptables Config
+Linux Iptables Config
 ----------------------------------------
 
 To make HTTP requests get proxied transparently, ipfwadm, ipchains, or
@@ -103,54 +47,34 @@ kernel must be compiled with the TRANSPARENT_PROXY feature enabled. You
 only get asked about this feature if you have requested to be prompted
 about EXPERIMENTAL things.
 
-If the dialin server (terminal server) host is not running a httpd on
-port 80, then the ipfwadm, ipchains, or iptables rules are different to when
-it is.
-
-Example when a httpd is running on port 80.
-
-# ipfwadm -I -a accept -P tcp -D localhost 80
-# ipfwadm -I -a accept -P tcp -D <ip of local network>/<bits-in-net> 80
-# ipfwadm -I -a accept -P tcp -D 0.0.0.0/0 80 -r 81
-
-	or
-
-# ipchains -A input -p tcp -d localhost 80 -j ACCEPT
-# ipchains -A input -p tcp -d <ip of local network>/<bits-in-net> 80 -j ACCEPT
-# ipchains -A input -p tcp -d 0.0.0.0/0 80 -j REDIRECT 81
-
-	or
-
-# iptables -t nat -A PREROUTING -p tcp -d localhost --dport 80 -j ACCEPT
-# iptables -t nat -A PREROUTING -p tcp -d <ip of local network>/<bits-in-net> --dport 80 -j ACCEPT
-# iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 81
+* iptables -t nat -A PREROUTING -p tcp -d localhost --dport 80 -j ACCEPT
+* iptables -t nat -A PREROUTING -p tcp -d <ip of local network>/<bits-in-net> --dport 80 -j ACCEPT
+* iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 81
 
 If no httpd is running on the local network you may want to
 reject connections quickly instead of accepting them.
 
-# ipfwadm -I -a reject -P tcp -D localhost 80
-# ipfwadm -I -a reject -P tcp -D <ip of local network>/<bits-in-net> 80
-# ipfwadm -I -a accept -P tcp -D 0.0.0.0/0 80 -r 81
-
-	or
-
-# ipchains -A input -p tcp -d localhost 80 -j REJECT
-# ipchains -A input -p tcp -d <ip of local network>/<bits-in-net> 80 -j REJECT
-# ipchains -A input -p tcp -d 0.0.0.0/0 80 -j REDIRECT 81
-
-	or
-
-# iptables -t nat -A PREROUTING -p tcp -d localhost --dport 80 -j REJECT
-# iptables -t nat -A PREROUTING -p tcp -d <ip of local network>/<bits-in-net> --dport 80 -j ACCEPT
-# iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 81
+* iptables -t nat -A PREROUTING -p tcp -d localhost --dport 80 -j REJECT
+* iptables -t nat -A PREROUTING -p tcp -d <ip of local network>/<bits-in-net> --dport 80 -j ACCEPT
+* iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 81
 
 These rules allow port 80 requests direct at the local network to pass (or
 get rejected). Then any requests to the outside world get redirected to
 port 81 and hence get handled by the transparent proxy.
 
+FreeBSD ipfw and ipnat Config
+-----------------------------
+
+I suggest you use ipfw.
+
+add 2 filter entries like below:
+
+* ipfw add 1000 allow tcp from <this-host> to any 80
+* ipfw add 1010 fwd <your-proxy-server>,81 tcp from any to any 80
+
 Who Am I?
 ---------
 
-My name is John Saunders <john@nlc.net.au> and I run a modest ISP in
-Sydney Australia, http://www.nlc.net.au/ take a look.
+My name is Maxim Chechel <maximchick@gmail.com> I'm a WEB/NFC/Ruby developer.
+Please feel free to contact me.
 
