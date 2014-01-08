@@ -43,6 +43,7 @@
 #include <net/if_arp.h>
 #include <ifaddrs.h>
 #include <time.h>
+#include <sys/mman.h>
 
 
 #if defined(IPFILTER) && (defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__))
@@ -173,6 +174,12 @@ static time_t			expiration = 3600;
 mactime_t 				*timetable = NULL;
 static char				*interface = NULL;
 
+static char				*redirect_template = "HTTP/1.1 302 Found\nLocation: %s\n\n";
+static char				redirect_buffer[4096];
+
+static char				trigger_host[128];
+static char				trigger_url[128];
+
 #ifdef IPFILTER
 /*
  * The /dev/ipnat device node.
@@ -209,7 +216,7 @@ int main(int argc, char **argv)
 	 * Parse the command line arguments.
 	 */
 
-	while ((arg = getopt(argc, argv, "dp:u:h:f:e:l:")) != EOF)
+	while ((arg = getopt(argc, argv, "dp:u:h:f:t:e:l:")) != EOF)
 	{
 		switch (arg)
 		{
@@ -224,8 +231,15 @@ int main(int argc, char **argv)
  		case 'f':
  			force_url = optarg;
  			force_url_length = strlen(force_url);
+ 			memset(redirect_buffer, 0, sizeof(redirect_buffer));
+ 			sprintf(redirect_buffer, redirect_template, force_url);
  			break;
+ 		
+ 		case 't':
+ 			sscanf(optarg, "http://%128[^/]/%128[^\n]", trigger_host, 
+				trigger_url);
 
+ 			break;
 
 #ifdef LOG_TO_FILE
 		case 'l':
@@ -308,6 +322,14 @@ int main(int argc, char **argv)
 #endif
 
 	fprintf(stderr, "Expiration time: %ld sec.\n", expiration);
+	if (NULL == force_url)
+		fprintf(stderr, "Hotspot URL to force: NONE\n");
+	else
+		fprintf(stderr, "Hotspot URL to force: %s\n", force_url);
+
+
+	fprintf(stderr, "Trigger host: %s\n", trigger_host);
+	fprintf(stderr, "Trigger URL: %s\n", trigger_url);
 
 	/*
 	 * Start by binding to the port, the child inherits this socket.
@@ -431,6 +453,7 @@ static void usage(char *prog, char *opt)
 	fprintf(stderr, "    -p port     Run as a server bound to the specified port.\n");
 	fprintf(stderr, "    -u user     Run as the specified user in server mode.\n");
 	fprintf(stderr, "    -f url      URL to force.\n");
+	fprintf(stderr, "    -t trigger  URL that triggers session start\n");
 #ifdef LOG_TO_FILE
 	fprintf(stderr, "    -l file     Log accesses to the specified file (relative to /).\n");
 #endif
@@ -807,6 +830,9 @@ int is_new_session(int sock, struct sockaddr_in *from_addr)
 	if (0 == ioctl(sock, SIOCGARP, &arp)) {
 		cur_time = time(NULL);
 
+// 		t = mmap(NULL, sizeof(mactime_t), PROT_READ | PROT_WRITE, 
+//                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
 		t = malloc(sizeof(mactime_t));
 		t->time = cur_time;
 		t->next = NULL;
@@ -890,7 +916,15 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 	natlookup_t			natlook;
 #endif
 
-//	is_new_session(sock, from_addr);
+	//if new session just started - forcing default hotspot URL
+	if (new_session) 
+	{
+#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
+		syslog(LOG_ERR, "it was a new session!");
+#endif
+		send_data(sock, redirect_buffer, strlen(redirect_buffer));
+		return;
+	}
 
 	/*
 	 * Initialise the connection structure.
