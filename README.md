@@ -42,14 +42,30 @@ Linux Iptables Config
 
 To make HTTP requests get proxied transparently, ipfwadm, ipchains, or
 iptables filter rules must be put in place to pass HTTP requests to the
-proxy that would normally pass through to the outside world. Also the Linux
-kernel must be compiled with the TRANSPARENT_PROXY feature enabled. You
-only get asked about this feature if you have requested to be prompted
-about EXPERIMENTAL things.
+proxy that would normally pass through to the outside world. 
 
-	iptables -t nat -A PREROUTING -p tcp -d localhost --dport 80 -j ACCEPT
-	iptables -t nat -A PREROUTING -p tcp -d <ip of local network>/<bits-in-net> --dport 80 -j ACCEPT
-	iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3128
+Make sure that client devices are in the same network otherwise hotproxy
+wont be able to get MAC addresses to push default hotspot page.
+
+Also the Linux kernel must be compiled with the TRANSPARENT_PROXY feature 
+enabled.
+
+If you running hotproxy on your router then you can set your iptables like this:
+
+	iptables -A PREROUTING -t nat -i eth0 -p tcp --dport 80 -j REDIRECT --to-port 3128
+
+We assume that eth0 is the interface where clients requests are comming to.
+
+Otherwise if you have hotproxy and router running on different machines:
+
+	iptables -t nat -A PREROUTING -i eth0 -s ! hotproxy-host -p tcp --dport 80 -j DNAT --to hotproxy-host:3128
+	iptables -t nat -A POSTROUTING -o eth0 -s local-network -d hotproxy-host -j SNAT --to router-host
+	iptables -A FORWARD -s local-network -d hotproxy-host -i eth0 -o eth0 -p tcp --dport 3128 -j ACCEPT	
+
+where:
+* hotproxy-host is the ip address of the host where hotproxy 
+* local-network - IP range of your local network
+* router-host - your router IP address
 
 If no httpd is running on the local network you may want to
 reject connections quickly instead of accepting them.
@@ -60,7 +76,7 @@ reject connections quickly instead of accepting them.
 
 These rules allow port 80 requests direct at the local network to pass (or
 get rejected). Then any requests to the outside world get redirected to
-port 81 and hence get handled by the transparent proxy.
+port 3128 and hence get handled by the transparent proxy.
 
 FreeBSD ipfw and ipnat Config
 -----------------------------
