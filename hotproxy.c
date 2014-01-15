@@ -16,12 +16,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-# include <syslog.h>
-#endif
-#ifdef HAVE_PATHS_H
-# include <paths.h>
-#endif
+#include <syslog.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <pwd.h>
@@ -31,10 +26,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
-
-#ifdef HAVE_GETOPT_H
-# include <getopt.h>
-#endif
+//#include <getopt.h>
 
 # include <sys/ioctl.h>
 
@@ -45,30 +37,7 @@
 #include <time.h>
 #include <sys/mman.h>
 
-
-#if defined(IPFILTER) && (defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__))
-# include <netinet/in_systm.h>
-# include <netinet/ip.h>
-# include <netinet/tcp.h>
-# include <net/if.h>
-# include <netinet/ip_compat.h>
-# include <netinet/ip_fil.h>
-# include <netinet/ip_nat.h>
-#endif
-
-#if defined(IPTABLES) && defined(__linux__)
 # include <linux/netfilter_ipv4.h>
-#endif
-
-/* For Solaris */
-#ifndef INADDR_NONE
-# define INADDR_NONE		(in_addr_t)-1
-#endif
-
-/* For older Linux */
-#if defined(SIGCLD) && !defined(SIGCHLD)
-# define SIGCHLD			SIGCLD
-#endif
 
 #ifndef _PATH_DEVNULL
 # define _PATH_DEVNULL		"/dev/null"
@@ -77,13 +46,10 @@
 # define _PATH_VARRUN		"/var/run/"
 #endif
 
-#define CONNECTION_TIMEOUT	10			/* 10 seconds */
 #define ACTIVITY_TIMEOUT	120			/* 120 seconds, 2 minutes */
 #define BUFFER_SIZE			4096		/* Read/write buffer size */
-#define REQUEST_SIZE		32768		/* Requests must fit in this size */
-#define REFERRER_SIZE		4096		/* Holds the referrer URL */
-#define HOSTNAME_SIZE		1024		/* Holds the requested hostname */
 
+#define SESSIONS_SIZE		100			/* 100 devices */
 /*
  * Typedefs.
  */
@@ -98,30 +64,13 @@ typedef struct connection_
 	struct sockaddr_in	dest_addr;						// Addr of intended destination.
 	char				request_buffer[BUFFER_SIZE];	// Requests are read into here.
 	char				response_buffer[BUFFER_SIZE];	// Responses are read into here.
-	char				request[REQUEST_SIZE];			// Buffer to hold the request.
-	int					request_length;					// Length of request.
-	char				*posted_content;				// Buffer to hold the posted content.
-	int					posted_content_length;			// Length of the posted content.
-	int					method_offset;					// Index of METHOD in 'request'.
-	int					method_end_offset;				// Index to end of METHOD in 'request'.
-	int					url_offset;						// Index of URL in 'request.
-	int					url_end_offset;					// Index to end of URL in 'request'.
-	int					version_offset;					// Index of VERSION in 'request'.
-	int					version_end_offset;				// Index to end of VERSION in 'request'.
-	char				host_header[HOSTNAME_SIZE];		// Extracted or looked up hostname header.
-	int					host_header_length;				// Length of hostname.
-	char				referer_header[REFERRER_SIZE];	// Extracted referrer header.
-	int					referer_header_length;			// Length of referrer.
-	int					content_length;					// Extracted content length header.
-	int					request_number;					// Number of requests handled by connection.
 }	connection_t;
 
-typedef struct mactime_t mactime_t;
-struct mactime_t
+typedef struct session_t session_t;
+struct session_t
 {
 	time_t time; //start time of the last session initiated by
 	unsigned char mac[6]; //this device
-	mactime_t *next;
 };
 
 /*
@@ -142,7 +91,7 @@ static int connect_to_proxy(ip_address_t ip, short port);
 static void server_main_loop(int sock, char *server_hostname, short server_port);
 static void trans_proxy(int sock, struct sockaddr_in *addr,
 						char *server_hostname, short server_port,
-						int new_session);
+						session_t * session);
 static int process_proxy_response(connection_t *conn, size_t last_read);
 static int process_client_request(connection_t *conn, size_t last_read);
 static int send_data(int fd, char *data, size_t length);
@@ -150,42 +99,34 @@ static int send_data(int fd, char *data, size_t length);
 static void write_pid(char *prog);
 static void term_signal(int sig);
 static void alarm_signal(int sig);
-#ifdef LOG_TO_FILE
-static void hup_signal(int sig);
-#endif
 
 static char* get_interface_name(int sock, ip_address_t *bind_ip);
-static int is_new_session(int sock, struct sockaddr_in *from_addr);
+static session_t * session_find(int sock, struct sockaddr_in *from_addr);
+static void	debug_message(char *message, ...);
 
 /*
  * Command line switches.
  */
 static char				*prog;
 static int				daemonize = 0;
+static int				debug_enabled = 0;
 static char				*force_url = NULL;
 static int				force_url_length;
-#ifdef LOG_TO_FILE
-static char				*log_file_name = NULL;
-static FILE				*log_file = NULL;
-#endif
 static int				ignore_alarm;
 static time_t			expiration = 3600;
 
-mactime_t 				*timetable = NULL;
+static session_t 		*sessions = NULL;
 static char				*interface = NULL;
 
 static char				*redirect_template = "HTTP/1.1 302 Found\nLocation: %s\n\n";
-static char				redirect_buffer[4096];
+static char				redirect_buffer[256];
 
 static char				trigger_host[128];
-static char				trigger_url[128];
+static char				trigger_url[256];
+static char				redirect_host[128];
 
-#ifdef IPFILTER
-/*
- * The /dev/ipnat device node.
- */
-static int				natdev = -1;
-#endif
+static char				*domains_whitelist = NULL;
+static char				temp_str[256];
 
 /*
  * Main loop.
@@ -199,9 +140,7 @@ int main(int argc, char **argv)
 	short				server_port = -1;
 	uid_t				run_uid = 0;
 	gid_t				run_gid = 0;
-#if !defined(DEBUG) && !defined(DEBUG_INPUT_REQUESTS) && !defined(DEBUG_OUTPUT_REQUESTS)
 	int					fd;
-#endif
 	int					sock;
 
 	/*
@@ -215,13 +154,24 @@ int main(int argc, char **argv)
 	/*
 	 * Parse the command line arguments.
 	 */
-
-	while ((arg = getopt(argc, argv, "dp:u:h:f:t:e:l:")) != EOF)
+	while ((arg = getopt(argc, argv, "dmp:u:h:f:t:e:w:")) != EOF)
 	{
 		switch (arg)
 		{
 		case 'd':
 			daemonize = 1;
+			break;
+
+ 		case 'm':
+ 			debug_enabled = 1;
+ 			break;
+
+		case 'p':
+			bind_port = getportnum(optarg);
+			break;
+
+		case 'h':
+			bind_ip = getipaddress(optarg);
 			break;
 
 		case 'e':
@@ -233,26 +183,20 @@ int main(int argc, char **argv)
  			force_url_length = strlen(force_url);
  			memset(redirect_buffer, 0, sizeof(redirect_buffer));
  			sprintf(redirect_buffer, redirect_template, force_url);
+
+ 			sscanf(force_url, "http://%128[^/]", redirect_host);
+
  			break;
  		
  		case 't':
- 			sscanf(optarg, "http://%128[^/]/%128[^\n]", trigger_host, 
-				trigger_url);
+ 			sscanf(optarg, "http://%128[^/]/%128[^\n]", trigger_host, temp_str);
+			snprintf(trigger_url, sizeof(trigger_url), "%s%s", "/", temp_str);
 
  			break;
 
-#ifdef LOG_TO_FILE
-		case 'l':
-			log_file_name = optarg;
-			break;
-#endif
-		case 'p':
-			bind_port = getportnum(optarg);
-			break;
-
-		case 'h':
-			bind_ip = getipaddress(optarg);
-			break;
+ 		case 'w':
+			domains_whitelist = optarg;
+ 			break;
 
 		case 'u':
 			run_uid = getuserid(optarg);
@@ -295,46 +239,43 @@ int main(int argc, char **argv)
 		usage(prog, "No server port was specified (or it was invalid).");
 	}
 
-
-#ifdef IPFILTER
-	/*
-	 * Now is a good time to open /dev/ipnat, before giving up our uid/gid.
-	 */
-	if ((natdev = open(IPL_NAT, O_RDONLY)) < 0)
-	{
-		perror("open(" IPL_NAT ")");
-		exit(1);
-	}
-#endif
-
-#ifdef LOG_TO_FILE
-	/*
-	 * Open the log file for the first time.
-	 */
-	if (log_file_name)
-	{
-		log_file = fopen(log_file_name, "a");
-# ifdef LOG_TO_FILE_LINEBUFF
-		if (log_file)
-			setvbuf(log_file, NULL, _IOLBF, BUFSIZ);
-# endif
-	}
-#endif
-
-	fprintf(stderr, "Expiration time: %ld sec.\n", expiration);
+	debug_message("Expiration time: %ld sec.", expiration);
 	if (NULL == force_url)
-		fprintf(stderr, "Hotspot URL to force: NONE\n");
+		debug_message("Hotspot URL to force: NONE");
 	else
-		fprintf(stderr, "Hotspot URL to force: %s\n", force_url);
+		debug_message("Hotspot URL to force: %s", force_url);
 
+	if (NULL == domains_whitelist) {
+		domains_whitelist = malloc(512);
+		strcpy(domains_whitelist, trigger_url);
+	}
 
-	fprintf(stderr, "Trigger host: %s\n", trigger_host);
-	fprintf(stderr, "Trigger URL: %s\n", trigger_url);
+	if (strlen(redirect_host)) {
+		sprintf(temp_str, "%s,%s", domains_whitelist, redirect_host);
+		strcpy(domains_whitelist, temp_str);
+	}
+	
+	//trigger host already present in whitelisted domains
+	if (NULL == strstr(domains_whitelist, trigger_host)) 
+	{
+		snprintf(temp_str, sizeof(temp_str), "%s,%s", domains_whitelist, trigger_host);
+		strcpy(domains_whitelist, temp_str);
+	}
+
+	debug_message("Domains white list: %s", domains_whitelist);
+	debug_message("Trigger host: %s", trigger_host);
+	debug_message("Trigger URL: %s", trigger_url);
 
 	/*
 	 * Start by binding to the port, the child inherits this socket.
 	 */
 	sock = bind_to_port(bind_ip, bind_port);
+
+	//Getting some shared memory for sessions
+	sessions = mmap(NULL, sizeof(session_t) * SESSIONS_SIZE, 
+			PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+	memset(sessions, 0, sizeof(session_t) * SESSIONS_SIZE);
 
 	/*
 	 * Start a server process.
@@ -367,11 +308,10 @@ int main(int argc, char **argv)
 		setsid();
 	}
 
-#if !defined(DEBUG) && !defined(DEBUG_INPUT_REQUESTS) && !defined(DEBUG_OUTPUT_REQUESTS)
 	/*
-	 * Point file descriptors to /dev/null, unless DEBUG is defined.
+	 * Point file descriptors to /dev/null, unless debug mode is enabled.
 	 */
-	if ((fd = open(_PATH_DEVNULL, O_RDWR, 0)) >= 0)
+	if (!debug_enabled && (fd = open(_PATH_DEVNULL, O_RDWR, 0)) >= 0)
 	{
 		dup2(fd, STDIN_FILENO);
 		dup2(fd, STDOUT_FILENO);
@@ -379,30 +319,24 @@ int main(int argc, char **argv)
 		if (fd > STDERR_FILENO)
 			close(fd);
 	}
-#endif
 
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
 	/*
 	 * Open syslog for logging errors.
 	 */
 	openlog(prog, LOG_PID, LOG_DAEMON);
-#endif
 
 	/*
 	 * Ignore some signals.
 	 */
 	if (daemonize)
 		signal(SIGINT, SIG_IGN);
+
 	signal(SIGQUIT, SIG_IGN);
 	signal(SIGTSTP, SIG_IGN);
 	signal(SIGCONT, SIG_IGN);
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGALRM, alarm_signal);
-#ifdef LOG_TO_FILE
-	signal(SIGHUP, hup_signal);
-#else
 	signal(SIGHUP, SIG_IGN);
-#endif
 	signal(SIGTERM, term_signal);
 
 	/*
@@ -426,9 +360,7 @@ int main(int argc, char **argv)
 	/*
 	 * Should never exit.
 	 */
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
 	closelog();
-#endif
 	exit(1);
 
 	return (0);
@@ -443,20 +375,15 @@ static void usage(char *prog, char *opt)
 	{
 		fprintf(stderr, "%s: %s\n", prog, opt);
 	}
-#ifdef LOG_TO_FILE
+
 	fprintf(stderr, "usage: %s [-p port [-d] [-h ipaddr] [-u user] [-e expiration]] [-l file]\n", prog);
-#else
-	fprintf(stderr, "usage: %s [-p port [-d] [-h ipaddr] [-u user] [-e expiration]] [-l file]\n", prog);
-#endif
-	fprintf(stderr, "    -d          Do not background the daemon in server mode.\n");
-	fprintf(stderr, "    -h ipaddr   Bind to the specified ipaddr in server mode.\n");
-	fprintf(stderr, "    -p port     Run as a server bound to the specified port.\n");
-	fprintf(stderr, "    -u user     Run as the specified user in server mode.\n");
-	fprintf(stderr, "    -f url      URL to force.\n");
-	fprintf(stderr, "    -t trigger  URL that triggers session start\n");
-#ifdef LOG_TO_FILE
-	fprintf(stderr, "    -l file     Log accesses to the specified file (relative to /).\n");
-#endif
+	fprintf(stderr, "    -d          	Do not background the daemon in server mode.\n");
+	fprintf(stderr, "    -h ipaddr   	Bind to the specified ipaddr in server mode.\n");
+	fprintf(stderr, "    -p port     	Run as a server bound to the specified port.\n");
+	fprintf(stderr, "    -u user     	Run as the specified user in server mode.\n");
+	fprintf(stderr, "    -f url      	URL to force.\n");
+	fprintf(stderr, "    -t trigger  	URL that triggers session start\n");
+	fprintf(stderr, "    -w whitelist 	Comma-separated white list of domains\n");
 	exit(1);
 }
 
@@ -489,10 +416,6 @@ static short getportnum(char *portnum)
 	else
 		port = htons(port);
 
-#ifdef DEBUG
-	printf("Port lookup %s -> %hd\n", portnum, ntohs(port));
-#endif
-
 	return (port);
 }
 
@@ -514,10 +437,6 @@ static ip_address_t getipaddress(char *ipaddr)
 		}
 		endhostent();
 	}
-
-#ifdef DEBUG
-	printf("IP lookup %s -> 0x%08lx\n", ipaddr, (unsigned long)ntohl(ip));
-#endif
 
 	return (ip);
 }
@@ -543,9 +462,7 @@ static uid_t getuserid(char *user)
 		uid = -1;
 	}
 
-#ifdef DEBUG
-	printf("User lookup %s -> %lu\n", user, (unsigned long)uid);
-#endif
+	debug_message("User lookup %s -> %lu\n", user, (unsigned long)uid);
 
 	endpwent();
 
@@ -569,9 +486,7 @@ static uid_t getgroupid(uid_t uid)
 		gid = -1;
 	}
 
-#ifdef DEBUG
-	printf("Group lookup %lu -> %lu\n", (unsigned long)uid, (unsigned long)gid);
-#endif
+	debug_message("Group lookup %lu -> %lu\n", (unsigned long)uid, (unsigned long)gid);
 
 	endpwent();
 
@@ -633,7 +548,7 @@ static int bind_to_port(ip_address_t bind_ip, short bind_port)
 	}
 
 	interface = get_interface_name(sock, &bind_ip);
-	fprintf(stderr, "Bound to interface: %s\n", interface);
+	debug_message("Bound to interface: %s", interface);
 
 	return (sock);
 }
@@ -646,18 +561,13 @@ static int connect_to_proxy(ip_address_t ip, short port)
 	struct sockaddr_in	addr;
 	int					sock;
 
-#ifdef DEBUG
-	printf("Connect to proxy 0x%08lx %d\n", (unsigned long)ntohl(ip), ntohs(port));
-#endif
+	debug_message("Connected to host 0x%08lx %d\n", (unsigned long)ntohl(ip), ntohs(port));
 
 	/*
 	 * Allocate a socket.
 	 */
 	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
 	{
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "socket(): %m");
-#endif
 		return (-1);
 	}
 
@@ -675,9 +585,6 @@ static int connect_to_proxy(ip_address_t ip, short port)
 	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
 	{
 		alarm(0);
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_WARNING, "connect(): %m");
-#endif
 		close(sock);
 		return (-1);
 	}
@@ -707,29 +614,10 @@ static void server_main_loop(int sock, char *server_hostname, short server_port)
 	struct sockaddr_in	addr;
 	socklen_t			len;
 	pid_t				pid;
-	int					new_session;
-#ifdef DO_DOUBLE_FORK
-	int					status;
-#endif
+	session_t			*session;
 
-	/*
-	 * Ignore dead children so no zombies should be left hanging. However some
-	 * systems don't allow this, see the DO_DOUBLE_FORK option.
-	 */
-#ifdef SA_NOCLDWAIT
-	/* Go BSD */
-	{
-		struct sigaction	sa;
-
-		memset(&sa, 0, sizeof(sa));
-		sa.sa_handler = SIG_IGN;
-		sa.sa_flags = SA_NOCLDWAIT;
-		sigaction(SIGCHLD, &sa, NULL);
-	}
-#else
 	/* Go Linux & SVR4 */
  	signal(SIGCHLD, SIG_IGN);
-#endif
 
 	for (;;)
 	{
@@ -742,18 +630,16 @@ static void server_main_loop(int sock, char *server_hostname, short server_port)
 			/*
 			 * Connection resets are common enough to log them as debug only.
 			 */
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
 			if (errno != ECONNRESET)
-				syslog(LOG_ERR, "accept(): %m");
-# ifdef LOG_TO_SYSLOG
-			else
-				syslog(LOG_INFO, "accept(): %m");
-# endif
-#endif
+				debug_message("Accept filed: %s", strerror(errno));
 		}
 
-		new_session = is_new_session(new_sock, &addr);
-
+		session = session_find(new_sock, &addr);
+		if (NULL == session) {
+			syslog(LOG_ERR, "ioctl error, check if you set up iptables correctly");
+			debug_message("ioctl error, check if you set up iptables correctly");
+		} 
+		else
 		/*
 		 * Create a new process to handle the connection.
 		 */
@@ -766,37 +652,16 @@ static void server_main_loop(int sock, char *server_hostname, short server_port)
 			break;
 
 		case 0:		/* Child */
-#ifdef DO_DOUBLE_FORK
-			/*
-			 * Some systems like to fork again as the child. This makes the client
-			 * run as a child of init so we don't have to handle reaping them.
-			 * However all this forking slows us downm so it's optional.
-			 */
-			if (fork() > 0)	/* Parent */
-				exit(0);
-#endif
-
 			/*
 			 * Start the proxy work in the new socket.
 			 */
-			trans_proxy(new_sock, &addr, server_hostname, server_port, new_session);
-			close(new_sock);
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-			closelog();
-#endif
-			exit(0);
 
-#ifdef DO_DOUBLE_FORK
-		default:	/* Parent */
-			/*
-			 * Wait for the child process to terminate. Since it forked another
-			 * child to handle the request, it should terminate quickly.
-			 */
-			waitpid(pid, &status, 0);
-			break;
-#endif
+			trans_proxy(new_sock, &addr, server_hostname, server_port, session);
+			close(new_sock);
+			closelog();
+			exit(0);
 		}
-///
+
 		/*
 		 * Close the socket as the child handles the call.
 		 */
@@ -805,100 +670,43 @@ static void server_main_loop(int sock, char *server_hostname, short server_port)
 }
 
 /*
- * Detects client's MAC(hardware) address and checks
- * if default hotspot page should be pushed to client
- * instead of requested page.
- *
- * Returns:
- * 1 - if default hotspot page should be pushed
- * 0 - if client already saw this page in it's current session is not expired
+ * Finds or creates session for this MAC 
+ * and returns pointer to this session
  */
-
-int is_new_session(int sock, struct sockaddr_in *from_addr)
-{
-	struct arpreq		arp;
-	mactime_t *t = NULL; //time, mac[6], *next
-	mactime_t *current, *last;
-	mactime_t *expired = NULL;
-	time_t cur_time;
+static session_t * session_find(int sock, struct sockaddr_in *from_addr) {
+	int i = 0;
+	session_t 		*session;
+	struct arpreq	arp;
+	time_t	current_time;
 
 	//Getting MAC of current client
 	arp.arp_pa = * (struct sockaddr *)from_addr;
 	strcpy(arp.arp_dev, interface);
 
+	if (0 != ioctl(sock, SIOCGARP, &arp)) 
+		return NULL;
+	
+	current_time = time(NULL);
 
-	if (0 == ioctl(sock, SIOCGARP, &arp)) {
-		cur_time = time(NULL);
+	for (i = 0; i < SESSIONS_SIZE; i++) {
+		session = &sessions[i];
 
-// 		t = mmap(NULL, sizeof(mactime_t), PROT_READ | PROT_WRITE, 
-//                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+		if (session->time && current_time - session->time > expiration)
+			session->time = 0;
 
-		t = malloc(sizeof(mactime_t));
-		t->time = cur_time;
-		t->next = NULL;
-		memcpy(t->mac, &arp.arp_ha.sa_data, 6);//6 bytes of mac address
-
-		//trying to find if there was a session with this mac before expiration
-		if (NULL == timetable)
-		{
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-			syslog(LOG_ERR, "Timetable is not initialized");
-#endif		
-			timetable = t;
-			return 1;
+		if (!memcmp(session->mac, (char *)&arp.arp_ha.sa_data, 6)) 
+			break;
+		 
+		//this is the end of sessions list - fill last session with
+		//MAC address of current device and return it
+		if (0 == session->mac[0] && 0 == session->mac[5]) {
+			memcpy(session->mac, (char *)&arp.arp_ha.sa_data, 6);
+			break;
 		}
-
-		for (current = timetable; current != NULL; current = current->next) {
-			if (!memcmp(current->mac, t->mac, 6)) //macs are equal
-			{
-				//session for current client expired
-				if (t->time - current->time > expiration) {
-					current->time = t->time; //renew time
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-					syslog(LOG_ERR, "Session expired");
-#endif
-					free(t); //device is already present in time table
-					return 1;
-				}
-				else
-				{
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-					syslog(LOG_ERR, "Session still alive");
-#endif
-					return 0;
-				}
-			} 
-			else 
-			if (t->time - current->time > expiration)
-				expired = current;
-
-			if (NULL == current->next)
-				last = current;
-		}
-		//if didn't find any device with t->mac adding current client
-		//device to the end of the list
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "Adding device to the end of the list");
-#endif
-		//if there is no expired session in timetable adding current device
-		//session to the end of the list
-		if (NULL == expired)
-			last->next = t;
-		else //otherwise - replacing expired session
-			memcpy(expired, t, sizeof(mactime_t));
-	} 
-	else {
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "ioctl error, check if you set up iptables correctly: %m");
-#endif
-		return 0;
+			
 	}
 
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-	syslog(LOG_ERR, "Nothing happened?!");
-#endif
-
-	return 1;
+	return session;
 }
 
 /*
@@ -906,25 +714,12 @@ int is_new_session(int sock, struct sockaddr_in *from_addr)
  */
 static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 						char *server_hostname, short server_port, 
-						int new_session)
+						session_t * session)
 {
 	connection_t		conn;
 	socklen_t			length;
 	int					max_fd;
 	fd_set				read_fd;
-#ifdef IPFILTER
-	natlookup_t			natlook;
-#endif
-
-	//if new session just started - forcing default hotspot URL
-	if (new_session) 
-	{
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "it was a new session!");
-#endif
-		send_data(sock, redirect_buffer, strlen(redirect_buffer));
-		return;
-	}
 
 	/*
 	 * Initialise the connection structure.
@@ -933,7 +728,6 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 	conn.client_fd = sock;
 	conn.client_addr = *from_addr;
 
-#if defined(IPTABLES) && defined(__linux__)
 	/*
 	 * The first thing we do is get the IP address that the client was
 	 * trying to connected to. Here lies part of the magic. Linux-2.4
@@ -943,69 +737,18 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 	length = sizeof(conn.dest_addr);
 	if (getsockopt(sock, SOL_IP, SO_ORIGINAL_DST, (char *)&conn.dest_addr, &length) < 0)
 	{
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "getsockopt(SO_ORIGINAL_DST): %m");
-#endif
+		syslog(LOG_ERR, "ioctl error, check if you set up iptables correctly: %m");
+		debug_message("ioctl error, check if you set up iptables correctly: %s", strerror(errno));
+
 		return;
 	}
+
+
 	
-#else/*!IPTABLES*/
-
-	/*
-	 * The first thing we do is get the IP address that the client was
-	 * trying to connected to. Here lies part of the magic. Normally
-	 * getsockname returns our address, but not with transparent proxying.
-	 */
-	length = sizeof(conn.dest_addr);
-	if (getsockname(sock, (struct sockaddr *)&conn.dest_addr, &length) < 0)
-	{
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "getsockname(): %m");
-#endif
-		return;
-	}
-
-#ifdef IPFILTER
-	/*
-	 * However, under IPFILTER, we have to do additional work. The "to_addr"
-	 * has been changed by the IP filter to trick the IP stack into
-	 * processing the packet locally. We need to lookup the real remote
-	 * address ourselves using an ioctl().
-	 */
-
-	/*
-	 * Build up the NAT natlookup structure.
-	 */
-	memset(&natlook, 0, sizeof(natlook));
-	natlook.nl_inip = conn.dest_addr.sin_addr;
-	natlook.nl_outip = conn.client_addr.sin_addr;
-	natlook.nl_flags = IPN_TCP;
-	natlook.nl_inport = conn.dest_addr.sin_port;
-	natlook.nl_outport = conn.client_addr.sin_port;
-
-	/*
-	 * Use the NAT device to lookup the mapping pair.
-	 */
-	if (ioctl(natdev, SIOCGNATL, &natlook) == -1)
-	{
-# if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "ioctl(SIOCGNATL): %m");
-# endif
-		return;
-	}
-
-	conn.dest_addr.sin_addr = natlook.nl_realip;
-	conn.dest_addr.sin_port = natlook.nl_realport;
-#endif
-
-#endif/*!IPTABLES*/
-
 	conn.proxy_fd = connect_to_proxy(conn.dest_addr.sin_addr.s_addr, conn.dest_addr.sin_port);
 	if (conn.proxy_fd == -1)
 	{
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-		syslog(LOG_ERR, "Could not connect to destination");
-#endif
+		debug_message("Could not connect to destination");
 		return;
 	}
 
@@ -1013,8 +756,7 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 	 * This loop acts a bit like the guy in the middle of a "bucket brigade".
 	 * When the client passes some data, it gets handed off to the server,
 	 * and vise-versa. However for data received from the client, it is
-	 * buffered until a full request is received. Once a full request is
-	 * received, the request is re-written before being sent to the server.
+	 * buffered until a full request is received. 
 	 */
 	for (;;)
 	{
@@ -1041,9 +783,7 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 			if (errno != EINTR)
 			{
 				alarm(0);
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
 				syslog(LOG_ERR, "select(): %m");
-#endif
 				close(conn.proxy_fd);
 				return;
 			}
@@ -1062,14 +802,9 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 			switch (length = read(conn.client_fd, conn.request_buffer, BUFFER_SIZE))
 			{
 			case -1:
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
 				if (errno != ECONNRESET)
 					syslog(LOG_WARNING, "read(client) failed: %m");
-# ifdef LOG_TO_SYSLOG
-				else
-					syslog(LOG_INFO, "read(client) failed: %m");
-# endif
-#endif
+
 				close(conn.proxy_fd);
 				return;
 
@@ -1079,14 +814,91 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 
 			default:
 				/*
+				 * If new session just started
+				 */
+				if (!session->time) 
+				{
+					debug_message("Session is not active");
+
+					char	*host = NULL;
+					int		host_length = 0;
+					char	*url = NULL;
+					int		url_length = 0;
+
+					char temp[256];
+
+					int	is_whitelisted = 0;
+
+					/*
+					 * Analyzing only GET-requests
+					 */
+					if (conn.request_buffer == strstr(conn.request_buffer, "GET ")) {
+						host = strstr(conn.request_buffer, "Host: ");
+						if (host) {
+							host += 6;
+							host_length = strchr(host, '\r') - host;
+
+							url = conn.request_buffer + 4;
+							url_length = strstr(url, " HTTP/1.") - url;
+
+							if (url_length >= 0) {
+								/*
+								 * Session trigger URL requested
+								 */
+								if ((strlen(trigger_host) == host_length && !memcmp(trigger_host, host, host_length)) &&
+									(strlen(trigger_url) == url_length && !memcmp(trigger_url, url, url_length))) 
+								{
+									session->time = time(NULL);
+									debug_message("Trigger URL requested: %.*s", url_length, url);
+								}
+								else 
+								{
+									/*
+									 * check if some whitelisted domain was requested
+									 */
+									memset(temp, 0, sizeof(temp));
+
+									char *comma;
+									int l = strlen(domains_whitelist);
+									char *first = domains_whitelist;
+									do 
+									{
+										comma = strchr(first, ',');
+
+										if (NULL == comma)
+											comma = domains_whitelist + l;
+
+										if (host_length == comma - first && !memcmp(host, first, host_length)) {
+											debug_message("Target host is whitelisted: %.*s", host_length, host);
+											is_whitelisted = 1;
+											break;
+										}
+
+										first = comma + 1;
+									} while (first < domains_whitelist + l);
+								}
+							}
+						}
+					}
+
+					/*
+					 * Forcing default hotspot URL
+					 */
+					if (!is_whitelisted) {
+						debug_message("Forcing hotspot URL: http://%s/%s", trigger_host, trigger_url);
+						close(conn.proxy_fd);
+						send_data(conn.client_fd, redirect_buffer, strlen(redirect_buffer));
+						return;
+					}
+
+				}
+
+				/*
 				 * Process requests read from the client. Returns 0 if a
 				 * processed request could not be written to the proxy.
 				 */
 				if (!process_client_request(&conn, length))
 				{
-#ifdef LOG_TO_SYSLOG
-					syslog(LOG_WARNING, "write(proxy) failed: %m");
-#endif
 					close(conn.proxy_fd);
 					return;
 				}
@@ -1102,9 +914,6 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 			switch (length = read(conn.proxy_fd, conn.response_buffer, BUFFER_SIZE))
 			{
 			case -1:
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-				syslog(LOG_WARNING, "read(proxy) failed: %m");
-#endif
 				close(conn.proxy_fd);
 				return;
 
@@ -1119,9 +928,6 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 				 */
 				if (!process_proxy_response(&conn, length))
 				{
-#ifdef LOG_TO_SYSLOG
-					syslog(LOG_WARNING, "write(client) failed: %m");
-#endif
 					close(conn.proxy_fd);
 					return;
 				}
@@ -1213,9 +1019,7 @@ static void write_pid(char *prog)
  */
 static void alarm_signal(int sig)
 {
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
 	syslog(LOG_NOTICE, "Alarm signal caught - connection timeout");
-#endif
 	if (!ignore_alarm)
 		exit(1);
 }
@@ -1230,9 +1034,7 @@ static void term_signal(int sig)
 	sprintf(filename, "%s%s.pid", _PATH_VARRUN, prog);
 	unlink(filename);
 
-#ifdef LOG_TO_SYSLOG
 	syslog(LOG_NOTICE, "Termination signal caught - exiting");
-#endif
 	exit(1);
 }
 
@@ -1260,41 +1062,15 @@ static char* get_interface_name(int sock, ip_address_t * bind_ip)
 	return result;
 }
 
-#ifdef LOG_TO_FILE
-/*
- * Catch HUP signals and re-open the log file.
- */
-static void hup_signal(int sig)
+void debug_message(char *message, ...)
 {
-	signal(sig, hup_signal);
+	if (debug_enabled) {
+		va_list args;
+		va_start(args, message);
 
-	/*
-	 * Close the current log file.
-	 */
-	if (log_file)
-	{
-		fclose(log_file);
-		log_file = NULL;
+		vprintf(message, args);
+		printf("\n");
+
+		va_end(args);
 	}
-
-	/*
-	 * Re-open the log file if it is closed.
-	 */
-	if (log_file == NULL && log_file_name)
-	{
-		log_file = fopen(log_file_name, "a");
-# ifdef LOG_TO_FILE_LINEBUFF
-		if (log_file)
-			setvbuf(log_file, NULL, _IOLBF, BUFSIZ);
-# endif
-	}
-
-# if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-	if (log_file)
-		syslog(LOG_NOTICE, "HUP signal caught - re-open log '%s'", log_file_name);
-	else if (log_file_name)
-		syslog(LOG_NOTICE, "HUP signal caught - re-open failed '%s'", log_file_name);
-# endif
 }
-
-#endif
